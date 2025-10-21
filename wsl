@@ -1,0 +1,547 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# =============================================================================
+# VM Provisioning Script - RHEL-Compatible Distributions
+# =============================================================================
+# Supports: CentOS 7, Rocky Linux 8/9/10
+# Usage: ./script.sh <distro> <vmname>
+# Example: ./script.sh rocky9 myvm
+# =============================================================================
+
+# Configurable Variables
+NET_NAME="default"                  # libvirt network name
+ROOT_PASS="${ROOT_PASS:-skyline}"   # default root password if not set
+DHCP_WAIT_SECS=60                   # seconds to wait for DHCP lease
+SLEEP_INTERVAL=2                    # polling interval
+IMAGE_DIR="/var/lib/libvirt/images" # base directory for images
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+# Convert IP address to integer for range calculations
+ip2int() {
+  local ip="$1"
+  local a b c d
+  IFS=. read -r a b c d <<<"$ip"
+  echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
+}
+
+# Convert integer back to IP address
+int2ip() {
+  local n=$1
+  echo "$(( (n>>24)&255 )).$(( (n>>16)&255 )).$(( (n>>8)&255 )).$(( n&255 ))"
+}
+
+# Generate random MAC address with KVM/QEMU prefix
+gen_mac() {
+  printf '52:54:00:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
+}
+
+# Find first available IP in DHCP range
+find_free_ip_in_range() {
+  local start_ip="$1" 
+  local end_ip="$2" 
+  local used_ips=()
+  
+  # Collect currently used IPs from DHCP leases
+  while read -r ip; do
+    [ -n "$ip" ] && used_ips+=("$ip")
+  done < <(virsh net-dhcp-leases "$NET_NAME" 2>/dev/null | awk '{ for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) { print $i; break } }' | cut -d/ -f1)
+
+  local s e
+  s=$(ip2int "$start_ip") || return 1
+  e=$(ip2int "$end_ip")   || return 1
+
+  for ((n=s; n<=e; n++)); do
+    candidate=$(int2ip "$n")
+    # Check if IP is already used
+    local used=0
+    for u in "${used_ips[@]}"; do
+      [ "$u" = "$candidate" ] && { used=1; break; }
+    done
+    [ $used -eq 0 ] && { echo "$candidate"; return 0; }
+  done
+
+  return 1
+}
+
+# Return the subnet CIDR for the current NET_NAME
+get_network_cidr() {
+  local xml
+  xml=$(virsh net-dumpxml "$NET_NAME" 2>/dev/null || true)
+  
+  local network prefix
+  network=$(echo "$xml" | awk -F"'" '/ip address=/{print $2; exit}')
+  prefix=$(echo "$xml" | awk -F"'" '/prefix=/ {print $2; exit}')
+  
+  if [ -n "$network" ] && [ -n "$prefix" ]; then
+    echo "$network/$prefix"
+    return 0
+  else
+    # fallback: try netmask
+    local mask
+    mask=$(echo "$xml" | awk -F"'" '/netmask=/{print $2; exit}')
+    if [ -n "$network" ] && [ -n "$mask" ]; then
+      # Convert mask to CIDR prefix
+      local nbits=0
+      local i1 i2 i3 i4
+      IFS=. read -r i1 i2 i3 i4 <<< "$mask"
+      for i in $i1 $i2 $i3 $i4; do
+        while ((i)); do
+          ((nbits+=i&1))
+          ((i>>=1))
+        done
+      done
+      echo "$network/$nbits"
+      return 0
+    fi
+  fi
+  
+  # Default fallback
+  echo "192.168.122.0/24"
+}
+
+# Checks if an IPv4 address is in the target network
+ip_in_network() {
+  local ip="$1" 
+  local network_cidr="$2"
+  local network prefix
+  
+  IFS=/ read -r network prefix <<<"$network_cidr"
+  
+  local ip_int network_int mask
+  ip_int=$(ip2int "$ip")
+  network_int=$(ip2int "$network")
+  mask=$(( 0xFFFFFFFF << (32 - prefix) & 0xFFFFFFFF ))
+  
+  [ $((ip_int & mask)) -eq $((network_int & mask)) ]
+}
+
+# =============================================================================
+# Distribution Configuration
+# =============================================================================
+
+set_distro_params() {
+  local distro="$1"
+  
+  case "$distro" in
+    centos7)
+      DISTRO_NAME="CentOS 7"
+      DEFAULT_USER="centos"
+      IMAGE_FILE="${IMAGE_DIR}/CentOS-7-x86_64-GenericCloud.qcow2"
+      IMAGE_URL="https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2"
+      OS_VARIANT="centos7.0"
+      ;;
+    rocky8)
+      DISTRO_NAME="Rocky Linux 8"
+      DEFAULT_USER="rocky"
+      IMAGE_FILE="${IMAGE_DIR}/Rocky-8-GenericCloud.latest.x86_64.qcow2"
+      IMAGE_URL="https://download.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud.latest.x86_64.qcow2"
+      OS_VARIANT="rocky8"
+      ;;
+    rocky9)
+      DISTRO_NAME="Rocky Linux 9"
+      DEFAULT_USER="rocky"
+      IMAGE_FILE="${IMAGE_DIR}/Rocky-9-GenericCloud.latest.x86_64.qcow2"
+      IMAGE_URL="https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2"
+      OS_VARIANT="rocky9"
+      ;;
+    rocky10)
+      DISTRO_NAME="Rocky Linux 10"
+      DEFAULT_USER="rocky"
+      IMAGE_FILE="${IMAGE_DIR}/Rocky-10-GenericCloud.latest.x86_64.qcow2"
+      IMAGE_URL="https://download.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud.latest.x86_64.qcow2"
+      OS_VARIANT="rocky9"  # Use rocky9 variant until rocky10 is available in libosinfo
+      ;;
+    *)
+      echo "Error: Unknown distribution '$distro'"
+      echo "Supported: centos7, rocky8, rocky9, rocky10"
+      return 1
+      ;;
+  esac
+  
+  export DISTRO_NAME DEFAULT_USER IMAGE_FILE IMAGE_URL OS_VARIANT
+}
+
+# =============================================================================
+# SSH Key Discovery
+# =============================================================================
+
+get_ssh_pubkey() {
+  if [ -n "${PUBKEY:-}" ]; then
+    echo "$PUBKEY"
+  elif [ -f "${HOME}/.ssh/id_ed25519.pub" ]; then
+    cat "${HOME}/.ssh/id_ed25519.pub"
+  elif [ -f "${HOME}/.ssh/id_rsa.pub" ]; then
+    cat "${HOME}/.ssh/id_rsa.pub"
+  else
+    echo "Error: No public key found in ~/.ssh/*.pub and PUBKEY not set." >&2
+    return 1
+  fi
+}
+
+# =============================================================================
+# MAC-aware IP Address Management
+# =============================================================================
+
+reserve_vm_ip() {
+  local vm_name="$1"
+  local vm_ip_requested="${VM_IP:-}"
+  local vm_ip=""
+  local mac=""
+
+  if [ -n "$vm_ip_requested" ]; then
+    echo "Using supplied VM_IP=${vm_ip_requested}"
+    vm_ip="$vm_ip_requested"
+  else
+    local xml start end
+    xml=$(virsh net-dumpxml "$NET_NAME" 2>/dev/null || true)
+    start=$(echo "$xml" | awk -F"'" '/range/ {print $2; exit}')
+    end=$(echo "$xml" | awk -F"'" '/range/ {print $4; exit}')
+
+    if [ -n "$start" ] && [ -n "$end" ]; then
+      echo "Attempting to find free IP in DHCP range $start - $end"
+      local freeip
+      freeip=$(find_free_ip_in_range "$start" "$end" || true)
+      if [ -n "$freeip" ]; then
+        vm_ip="$freeip"
+        echo "Selected IP: $vm_ip"
+      else
+        echo "No free IP found in DHCP range; will fallback to polling after boot."
+      fi
+    else
+      echo "Could not determine DHCP range for network $NET_NAME; skipping reservation."
+    fi
+  fi
+
+  if [ -n "$vm_ip" ]; then
+    mac="$(gen_mac)"
+    local host_xml="<host mac='${mac}' ip='${vm_ip}'/>"
+    echo "Reserving IP ${vm_ip} for MAC ${mac} on network ${NET_NAME}..."
+
+    if ! virsh net-update "$NET_NAME" add ip-dhcp-host "$host_xml" --live --config 2>/dev/null; then
+      echo "Warning: Failed to add DHCP reservation (may need root privileges). Continuing without reservation."
+      vm_ip=""
+      mac=""
+    else
+      echo "Reservation successful."
+      # Update /etc/hosts immediately with the reserved IP, if the IP is valid
+      local netcidr
+      netcidr=$(get_network_cidr)
+      if [[ "$vm_ip" =~ ^127\. ]]; then
+        echo "Not updating /etc/hosts: $vm_ip is a loopback address"
+      elif ! ip_in_network "$vm_ip" "$netcidr"; then
+        echo "Not updating /etc/hosts: $vm_ip is not within network $netcidr"
+      else
+        sudo sed -i.bak -E "/(^|[[:space:]])${vm_name}(\$|[[:space:]])/d" /etc/hosts 2>/dev/null || true
+        echo -e "${vm_ip}\t${vm_name}" | sudo tee -a /etc/hosts >/dev/null
+        echo "/etc/hosts updated: ${vm_name} -> ${vm_ip}"
+      fi
+    fi
+  fi
+
+  export VM_IP="$vm_ip"
+  export MAC="$mac"
+}
+
+# Only accept IPs that match MAC and are valid (not loopback, in network)
+poll_for_vm_ip() {
+  local vm_name="$1"
+  local mac_addr="${MAC:-}"
+
+  local netcidr
+  netcidr=$(get_network_cidr)
+  
+  # If no MAC was set, try to get it from the domain
+  if [ -z "$mac_addr" ]; then
+    mac_addr=$(virsh domiflist "$vm_name" 2>/dev/null | awk 'NR>2{print $5; exit}' || true)
+  fi
+  
+  [ -z "$mac_addr" ] && return 1
+
+  # Query DHCP leases for this specific MAC address
+  local ip
+  ip=$(virsh net-dhcp-leases "$NET_NAME" 2>/dev/null | awk -v m="$mac_addr" '$0 ~ m { for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) { print $i; exit } }' | cut -d'/' -f1 || true)
+  
+  if [ -n "$ip" ]; then
+    # Validate the discovered IP
+    if [[ "$ip" =~ ^127\. ]]; then
+      echo "Rejecting loopback address: $ip" >&2
+      return 1
+    elif ! ip_in_network "$ip" "$netcidr"; then
+      echo "Rejecting address not in network $netcidr: $ip" >&2
+      return 1
+    else
+      echo "$ip"
+      return 0
+    fi
+  fi
+  
+  return 1
+}
+
+wait_for_vm_ip() {
+  local vm_name="$1"
+  local discovered_ip=""
+  local elapsed=0
+
+  local mac_addr="${MAC:-}"
+  if [ -z "$mac_addr" ]; then
+    mac_addr=$(virsh domiflist "$vm_name" 2>/dev/null | awk 'NR>2{print $5; exit}' || true)
+  fi
+
+  local netcidr
+  netcidr=$(get_network_cidr)
+
+  echo "Polling for VM IP address (timeout: ${DHCP_WAIT_SECS}s)..."
+  echo "Tracking MAC: $mac_addr on network: $netcidr"
+
+  while [ "$elapsed" -lt "$DHCP_WAIT_SECS" ]; do
+    discovered_ip="$(poll_for_vm_ip "$vm_name" 2>/dev/null || true)"
+
+    if [ -n "$discovered_ip" ]; then
+      echo "Found valid IP: $discovered_ip"
+      
+      # Update /etc/hosts with the discovered valid IP
+      sudo sed -i.bak -E "/(^|[[:space:]])${vm_name}(\$|[[:space:]])/d" /etc/hosts 2>/dev/null || true
+      echo -e "${discovered_ip}\t${vm_name}" | sudo tee -a /etc/hosts >/dev/null
+      echo "/etc/hosts updated: ${vm_name} -> ${discovered_ip}"
+      
+      export VM_IP="$discovered_ip"
+      return 0
+    fi
+
+    sleep "$SLEEP_INTERVAL"
+    elapsed=$((elapsed + SLEEP_INTERVAL))
+  done
+
+  echo "Warning: Could not determine a valid VM IP after ${DHCP_WAIT_SECS}s." >&2
+  echo "The VM may still be booting or there may be a network configuration issue." >&2
+  echo "You can check manually with: virsh net-dhcp-leases $NET_NAME" >&2
+  return 1
+}
+
+# =============================================================================
+# Cloud-Init Configuration
+# =============================================================================
+
+create_cloudinit_userdata() {
+  local vm_name="$1"
+  local default_user="$2"
+  local ssh_pubkey="$3"
+  local root_password="$4"
+  local output_file="$5"
+  
+  cat > "$output_file" <<EOF
+#cloud-config
+# Generated cloud-init configuration for RHEL-compatible VM
+
+# Set hostname for the guest VM
+hostname: ${vm_name}
+fqdn: ${vm_name}.localdomain
+manage_etc_hosts: true
+
+users:
+  # Root user configuration
+  - name: root
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ${ssh_pubkey}
+  
+  # Default distribution user
+  - name: ${default_user}
+    groups: wheel
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ${ssh_pubkey}
+
+# Enable SSH password authentication
+ssh_pwauth: true
+
+# Set passwords for both users
+chpasswd:
+  list: |
+    root:${root_password}
+    ${default_user}:${root_password}
+  expire: False
+
+# Configure SSH daemon and set persistent hostname
+runcmd:
+  - [ /bin/sh, -c, "if grep -q '^PermitRootLogin' /etc/ssh/sshd_config; then sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config; else echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config; fi" ]
+  - [ /bin/sh, -c, "if grep -q '^PasswordAuthentication' /etc/ssh/sshd_config; then sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config; else echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config; fi" ]
+  - [ systemctl, restart, sshd ]
+  - [ hostnamectl, set-hostname, ${vm_name} ]
+EOF
+}
+
+create_cloudinit_metadata() {
+  local vm_name="$1"
+  local output_file="$2"
+  
+  # Generate a unique instance-id using timestamp
+  local instance_id="${vm_name}-$(date +%s)"
+  
+  cat > "$output_file" <<EOF
+instance-id: ${instance_id}
+local-hostname: ${vm_name}
+EOF
+}
+
+# =============================================================================
+# VM Provisioning (RHEL-Compatible)
+# =============================================================================
+
+provision_rhel_vm() {
+  local vm_name="$1"
+  
+  echo "=========================================="
+  echo "Provisioning ${DISTRO_NAME} VM: ${vm_name}"
+  echo "=========================================="
+  
+  # Step 1: Download cloud image if needed
+  if [ ! -f "$IMAGE_FILE" ]; then
+    echo "Downloading ${DISTRO_NAME} cloud image..."
+    curl -L -o "$IMAGE_FILE" "$IMAGE_URL"
+    echo "Download complete: $IMAGE_FILE"
+  else
+    echo "Using existing image: $IMAGE_FILE"
+  fi
+  
+  # Step 2: Get SSH public key
+  echo "Discovering SSH public key..."
+  PUBKEY=$(get_ssh_pubkey) || exit 1
+  echo "SSH key found"
+  
+  # Step 3: Reserve IP address (with MAC) if possible
+  echo "Managing IP address assignment..."
+  reserve_vm_ip "$vm_name"
+  
+  # Step 4: Create cloud-init configuration files
+  echo "Generating cloud-init configuration..."
+  CLOUDINIT_USERDATA="$(mktemp /tmp/${vm_name}-userdata.XXXXXX.yml)"
+  CLOUDINIT_METADATA="$(mktemp /tmp/${vm_name}-metadata.XXXXXX.yml)"
+  
+  create_cloudinit_userdata "$vm_name" "$DEFAULT_USER" "$PUBKEY" "$ROOT_PASS" "$CLOUDINIT_USERDATA"
+  create_cloudinit_metadata "$vm_name" "$CLOUDINIT_METADATA"
+  
+  echo "Cloud-init user-data: $CLOUDINIT_USERDATA"
+  echo "Cloud-init meta-data: $CLOUDINIT_METADATA"
+  echo "  - Hostname: ${vm_name}"
+  echo "  - Root user: enabled with password and SSH key"
+  echo "  - Default user: ${DEFAULT_USER} with sudo access"
+  
+  # Step 5: Create VM-specific disk using backing file
+  VM_DISK="${IMAGE_DIR}/${vm_name}.qcow2"
+  if ! qemu-img info "$VM_DISK" >/dev/null 2>&1; then
+    echo "Creating VM disk: $VM_DISK"
+    qemu-img create -f qcow2 -b "$IMAGE_FILE" -F qcow2 "$VM_DISK" 20G
+  else
+    echo "VM disk already exists: $VM_DISK"
+  fi
+  
+  # Step 6: Build network configuration
+  NET_ARG="network=${NET_NAME}"
+  if [ -n "$MAC" ]; then
+    NET_ARG="network=${NET_NAME},mac=${MAC}"
+    echo "Network: ${NET_NAME} with reserved MAC ${MAC}"
+  else
+    # Generate MAC even if reservation failed
+    MAC=$(gen_mac)
+    NET_ARG="network=${NET_NAME},mac=${MAC}"
+    echo "Network: ${NET_NAME} with generated MAC ${MAC}"
+  fi
+  
+  # Step 7: Create VM with virt-install
+  echo "Creating VM with virt-install..."
+  virt-install --name "$vm_name" \
+    --memory 4096 \
+    --vcpus 2 \
+    --import \
+    --disk path="$VM_DISK",format=qcow2,bus=virtio \
+    --network "$NET_ARG" \
+    --os-variant "$OS_VARIANT" \
+    --cloud-init user-data="$CLOUDINIT_USERDATA",meta-data="$CLOUDINIT_METADATA" \
+    --graphics none \
+    --noautoconsole
+  
+  echo "VM creation initiated"
+  
+  # Step 8: Wait for IP if not already set
+  if [ -z "$VM_IP" ]; then
+    wait_for_vm_ip "$vm_name" || true
+  fi
+  
+  # Step 9: Cleanup
+  rm -f "$CLOUDINIT_USERDATA" "$CLOUDINIT_METADATA"
+  
+  # Step 10: Display summary
+  echo ""
+  echo "=========================================="
+  echo "VM Provisioning Complete!"
+  echo "=========================================="
+  echo "VM Name:       $vm_name"
+  echo "Hostname:      $vm_name (set in guest)"
+  echo "Distribution:  $DISTRO_NAME"
+  echo "IP Address:    ${VM_IP:-pending - check with 'virsh net-dhcp-leases $NET_NAME'}"
+  echo "MAC Address:   $MAC"
+  echo "Default User:  $DEFAULT_USER"
+  echo "Root Password: $ROOT_PASS"
+  echo ""
+  echo "Access via:"
+  if [ -n "$VM_IP" ]; then
+    echo "  ssh root@${vm_name}    (or ssh root@${VM_IP})"
+    echo "  ssh ${DEFAULT_USER}@${vm_name}    (or ssh ${DEFAULT_USER}@${VM_IP})"
+  else
+    echo "  Wait for network initialization, then:"
+    echo "  ssh root@${vm_name}    (once DNS/hosts is configured)"
+    echo "  ssh ${DEFAULT_USER}@${vm_name}"
+  fi
+  echo ""
+  echo "Verify hostname in guest with:"
+  echo "  ssh ${DEFAULT_USER}@${vm_name} hostname"
+  echo "=========================================="
+}
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+main() {
+  local distro="${1:-}"
+  local vm_name="${2:-}"
+  
+  # Validate arguments
+  if [ -z "$distro" ] || [ -z "$vm_name" ]; then
+    echo "Usage: $0 <distro> <vmname>"
+    echo ""
+    echo "Supported distributions:"
+    echo "  centos7  - CentOS 7 (user: centos)"
+    echo "  rocky8   - Rocky Linux 8 (user: rocky)"
+    echo "  rocky9   - Rocky Linux 9 (user: rocky)"
+    echo "  rocky10  - Rocky Linux 10 (user: rocky)"
+    echo ""
+    echo "Example: $0 rocky9 myvm"
+    echo ""
+    echo "Environment variables:"
+    echo "  ROOT_PASS  - Root password (default: skyline)"
+    echo "  VM_IP      - Specific IP to reserve (optional)"
+    echo "  PUBKEY     - SSH public key (auto-detected if not set)"
+    echo "  NET_NAME   - Libvirt network (default: default)"
+    exit 2
+  fi
+  
+  # Set distribution parameters
+  if ! set_distro_params "$distro"; then
+    exit 1
+  fi
+  
+  # Provision VM
+  provision_rhel_vm "$vm_name"
+}
+
+# Execute main function
+main "$@"
